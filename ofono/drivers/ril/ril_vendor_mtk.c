@@ -83,6 +83,7 @@ struct ril_vendor_hook_mtk_auto {
 struct ril_mtk_msg {
 	gboolean attach_apn_has_roaming_protocol;
 	guint request_resume_registration;
+	guint request_set_call_indication;
 
 	/* See ril_vendor_mtk_auto_detect_event */
 #define unsol_msgs unsol_ps_network_state_changed
@@ -97,6 +98,7 @@ struct ril_mtk_msg {
 static const struct ril_mtk_msg msg_mtk1 = {
 	.attach_apn_has_roaming_protocol = TRUE,
 	.request_resume_registration = 2050,
+	.request_set_call_indication = 2065,
 	.unsol_ps_network_state_changed = 3012,
 	.unsol_registration_suspended = 3021,
 	.unsol_incoming_call_indication = 3037,
@@ -132,6 +134,8 @@ static const char *ril_vendor_mtk_request_to_string
 
 	if (request == msg->request_resume_registration) {
 		return "MTK_RESUME_REGISTRATION";
+	} else if (request == msg->request_set_call_indication) {
+		return "MTK_SET_CALL_INDICATION";
 	} else {
 		return NULL;
 	}
@@ -340,12 +344,68 @@ static void ril_vendor_mtk_ps_network_state_changed(GRilIoChannel *io,
 	ril_network_query_registration_state(self->network);
 }
 
-static void ril_vendor_mtk_call_state_changed(GRilIoChannel *io,
-		guint id, const void *data, guint len, void *user_data)
+static void ril_vendor_mtk_incoming_call_indication(GRilIoChannel *io, guint id,
+				const void *data, guint len, void *user_data)
 {
-	/* Ignore the payload, let ril_voicecall.c do its normal stuff */
-	grilio_channel_inject_unsol_event(io,
-			RIL_UNSOL_RESPONSE_CALL_STATE_CHANGED, NULL, 0);
+	struct ril_vendor_hook_mtk *self = user_data;
+	const struct ril_mtk_msg *msg = self->msg;
+	GRilIoParser rilp;
+	int nparams;
+	gchar *call_id = NULL, *number = NULL;
+	gchar *type = NULL, *call_mode = NULL, *seq_no = NULL;
+
+	if (msg->request_set_call_indication) {
+		GASSERT(id == msg->unsol_incoming_call_indication);
+		grilio_parser_init(&rilp, data, len);
+
+		if (!grilio_parser_get_int32(&rilp, &nparams) || nparams < 5) {
+			DBG("unexpected params count");
+			return;
+		}
+
+		call_id = grilio_parser_get_utf8(&rilp);
+		if (!call_id) {
+			DBG("no call_id value returned!");
+			return;
+		}
+
+		number = grilio_parser_get_utf8(&rilp);
+		type = grilio_parser_get_utf8(&rilp);
+		call_mode = grilio_parser_get_utf8(&rilp);
+
+		seq_no = grilio_parser_get_utf8(&rilp);
+		if (!call_id) {
+			DBG("no seq_no value returned!");
+			g_free(call_id);
+			g_free(number);
+			g_free(type);
+			g_free(call_mode);
+			return;
+		}
+
+		DBG("slot=%u, call_id=%s, number=%s, type=%s, call_mode=%s, seq_no=%s",
+			self->slot, call_id, number, type, call_mode, seq_no);
+
+		GRilIoRequest* req = grilio_request_new();
+		grilio_request_append_int32(req, 3);
+		grilio_request_append_int32(req, 0); // mode - IMS_ALLOW_INCOMING_CALL_INDICATION
+		grilio_request_append_int32(req, atoi(call_id));
+		grilio_request_append_int32(req, atoi(seq_no));
+
+		grilio_queue_send_request(self->q, req,
+				msg->request_set_call_indication);
+		grilio_request_unref(req);
+
+		g_free(call_id);
+		g_free(number);
+		g_free(type);
+		g_free(call_mode);
+		g_free(seq_no);
+	} else {
+		/* Ignore the payload, let ril_voicecall.c do its normal stuff */
+		grilio_channel_inject_unsol_event(io,
+				RIL_UNSOL_RESPONSE_CALL_STATE_CHANGED, NULL, 0);
+	}
 }
 
 static GRilIoRequest *ril_vendor_mtk_data_call_req
@@ -443,7 +503,7 @@ static void ril_vendor_mtk_hook_subscribe(struct ril_vendor_hook_mtk *self)
 	if (msg->unsol_incoming_call_indication) {
 		self->ril_event_id[MTK_EVENT_INCOMING_CALL_INDICATION] =
 			grilio_channel_add_unsol_event_handler(self->io,
-				ril_vendor_mtk_call_state_changed,
+				ril_vendor_mtk_incoming_call_indication,
 				msg->unsol_incoming_call_indication, self);
 	}
 }
